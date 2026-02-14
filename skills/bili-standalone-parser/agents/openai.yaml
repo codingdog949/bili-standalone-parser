@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bilibili Content Parser"
+  short_description: "Parse Bilibili URL to text JSON"
+  default_prompt: "Use $bili-standalone-parser to parse a Bilibili video URL and return structured JSON content."
