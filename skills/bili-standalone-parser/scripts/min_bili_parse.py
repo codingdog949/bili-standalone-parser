@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import platform
 import re
 import sys
 import tempfile
@@ -24,6 +25,15 @@ _PLAYINFO_PATTERN = re.compile(r"__playinfo__\s*=\s*(\{.*?\})\s*</script>", re.S
 _SHORT_LINK_HOSTS = {"b23.tv", "www.b23.tv"}
 _CANONICAL_HOSTS = {"www.bilibili.com", "bilibili.com"}
 _MODEL_ALIASES = {"whisper-small": "small", "whisper-base": "base", "whisper-tiny": "tiny"}
+_COREML_MODEL_REPOS = {
+    "tiny": "mlx-community/whisper-tiny-mlx",
+    "base": "mlx-community/whisper-base-mlx",
+    "small": "mlx-community/whisper-small-mlx",
+    "medium": "mlx-community/whisper-medium-mlx",
+    "large-v2": "mlx-community/whisper-large-v2-mlx-fp32",
+    "large-v3": "mlx-community/whisper-large-v3-mlx",
+    "turbo": "mlx-community/whisper-turbo",
+}
 logger = logging.getLogger("min_bili_parse")
 
 
@@ -277,7 +287,7 @@ def _summary(text: str) -> str | None:
     return "；".join(sentences[:3])
 
 
-def _transcribe_audio(audio_path: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+def _transcribe_audio_faster_whisper(audio_path: str, model: str) -> tuple[str, list[dict[str, Any]]]:
     resolved_model = _resolve_model_name(model)
     try:
         from faster_whisper import WhisperModel
@@ -305,12 +315,82 @@ def _transcribe_audio(audio_path: str, model: str) -> tuple[str, list[dict[str, 
         raise ParserError(ErrorCode.ASR_FAILED, f"asr failed: {exc}", stage="asr") from exc
 
 
+def _transcribe_audio_coreml(audio_path: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+    model_repo = _resolve_coreml_model_repo(model)
+    try:
+        import mlx_whisper
+    except ImportError as exc:
+        raise ParserError(
+            ErrorCode.ASR_FAILED,
+            "mlx-whisper not installed; install with `pip install mlx-whisper`",
+            stage="asr",
+        ) from exc
+
+    try:
+        output = mlx_whisper.transcribe(audio_path, path_or_hf_repo=model_repo, word_timestamps=False)
+        raw_segments = output.get("segments") or []
+        segments = [
+            {"start": float(s.get("start", 0.0)), "end": float(s.get("end", 0.0)), "text": str(s.get("text", "")).strip()}
+            for s in raw_segments
+            if str(s.get("text", "")).strip()
+        ]
+        if not segments:
+            text = str(output.get("text", "")).strip()
+            if text:
+                segments = [{"start": 0.0, "end": 0.0, "text": text}]
+        if not segments:
+            raise ParserError(ErrorCode.ASR_FAILED, "asr returned empty transcript", stage="asr")
+        language = str(output.get("language", "unknown"))
+        return language, segments
+    except ParserError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ParserError(ErrorCode.ASR_FAILED, f"asr failed: {exc}", stage="asr") from exc
+
+
+def _transcribe_audio(audio_path: str, model: str) -> tuple[str, list[dict[str, Any]]]:
+    backend = (os.getenv("ASR_BACKEND", "").strip().lower()) or _default_asr_backend()
+    if backend in {"coreml", "mlx"}:
+        try:
+            return _transcribe_audio_coreml(audio_path, model)
+        except ParserError as exc:
+            if _is_enabled("ASR_COREML_FALLBACK_TO_FASTER_WHISPER", "1"):
+                logger.warning(
+                    "coreml backend failed (code=%s stage=%s message=%s); fallback to faster-whisper",
+                    exc.code,
+                    exc.stage,
+                    exc.message,
+                )
+                return _transcribe_audio_faster_whisper(audio_path, model)
+            raise
+    if backend in {"faster-whisper", "cpu"}:
+        return _transcribe_audio_faster_whisper(audio_path, model)
+    raise ParserError(ErrorCode.ASR_FAILED, f"unsupported ASR_BACKEND: {backend}", stage="asr")
+
+
 def _resolve_model_name(model: str) -> str:
     return _MODEL_ALIASES.get(model, model)
 
 
+def _resolve_coreml_model_repo(model: str) -> str:
+    override = os.getenv("ASR_COREML_MODEL_REPO", "").strip()
+    if override:
+        return override
+    resolved = _resolve_model_name(model)
+    if "/" in resolved:
+        return resolved
+    return _COREML_MODEL_REPOS.get(resolved, f"mlx-community/whisper-{resolved}")
+
+
 def _is_enabled(env_name: str, default: str = "1") -> bool:
     return os.getenv(env_name, default).lower() not in {"0", "false", "no"}
+
+
+def _default_asr_backend() -> str:
+    machine = platform.machine().lower()
+    if platform.system() == "Darwin" and machine in {"arm64", "aarch64"}:
+        return "coreml"
+    return "faster-whisper"
 
 
 def _build_cookie_header(raw_cookie: str | None, sessdata: str | None) -> str | None:
@@ -331,6 +411,12 @@ def _build_cookie_header(raw_cookie: str | None, sessdata: str | None) -> str | 
 
 
 def _ensure_asr_model_ready(model: str) -> None:
+    backend = (os.getenv("ASR_BACKEND", "").strip().lower()) or _default_asr_backend()
+    if backend in {"coreml", "mlx"}:
+        # mlx-whisper lazily downloads model at first transcription call.
+        logger.info("asr warmup skipped for coreml backend (lazy model download)")
+        return
+
     resolved_model = _resolve_model_name(model)
     logger.info("asr warmup start model=%s resolved=%s", model, resolved_model)
     try:
