@@ -17,7 +17,7 @@
 flowchart LR
     U["User / CLI Caller"] --> P["min_bili_parse.py"]
     P --> B["Bilibili Web/API"]
-    P --> A["faster-whisper (local ASR)"]
+    P --> A["ASR: coreml(mlx-whisper) -> faster-whisper fallback"]
     P --> L["Local Log File"]
     P --> O["stdout JSON / stderr JSON"]
 ```
@@ -86,8 +86,12 @@ HTTPS_PROXY=http://127.0.0.1:7890 \
 ALL_PROXY= \
 python skills/bili-standalone-parser/scripts/min_bili_parse.py "<url>"
 
-# 控制 ASR 预热和模型
-ASR_WARMUP=1 ASR_MODEL=whisper-small \
+# 使用 CoreML/Apple 加速后端（Darwin arm64 默认）
+ASR_BACKEND=coreml ASR_MODEL=whisper-small \
+python skills/bili-standalone-parser/scripts/min_bili_parse.py "<url>"
+
+# 在非 Darwin arm64 环境（默认）或手动强制使用 faster-whisper
+ASR_BACKEND=faster-whisper ASR_MODEL=whisper-small \
 python skills/bili-standalone-parser/scripts/min_bili_parse.py "<url>"
 ```
 
@@ -101,8 +105,11 @@ python skills/bili-standalone-parser/scripts/min_bili_parse.py "<url>"
 | `HTTP_PROXY` | empty | HTTP 代理 |
 | `HTTPS_PROXY` | empty | HTTPS 代理 |
 | `ALL_PROXY` | empty | 通用代理 |
-| `ASR_WARMUP` | `1` | 启动时是否预热/下载 ASR 模型 |
+| `ASR_WARMUP` | `1` | 启动时是否预热/下载 ASR 模型（仅 `faster-whisper` 生效） |
 | `ASR_MODEL` | `whisper-small` | ASR 模型名（支持别名映射） |
+| `ASR_BACKEND` | auto (`Darwin arm64` => `coreml`, others => `faster-whisper`) | ASR 后端：`coreml`(mlx-whisper) 或 `faster-whisper` |
+| `ASR_COREML_MODEL_REPO` | empty | CoreML 后端模型仓库（如 `mlx-community/whisper-small`） |
+| `ASR_COREML_FALLBACK_TO_FASTER_WHISPER` | `1` | CoreML 后端失败时是否回退到 `faster-whisper` |
 | `HTTP_TIMEOUT_SEC` | `12.0` | 上游请求超时秒数 |
 | `TEMP_DIR` | `/tmp` | 音频临时文件目录 |
 | `MAX_AUDIO_MB` | `200` | 音频下载上限（MB） |
@@ -115,7 +122,7 @@ python skills/bili-standalone-parser/scripts/min_bili_parse.py "<url>"
 - `UPSTREAM_CONNECT_FAILED`：先检查网络、DNS、代理配置与 Bilibili 可达性。
 - `UPSTREAM_RATE_LIMIT`：上游限流，建议重试并降低请求频率。
 - `VIDEO_NOT_FOUND`：确认 BV 号是否存在、链接是否正确。
-- `ASR_FAILED`：确认 `faster-whisper` 安装成功，模型可下载或本地缓存可用。
+- `ASR_FAILED`：确认 `mlx-whisper`（CoreML 后端）或 `faster-whisper` 安装成功，模型可下载或本地缓存可用。
 - `AUDIO_FETCH_FAILED`：检查页面解析与音频下载链路，必要时调整代理与超时。
 
 ## What to do if this fails
